@@ -305,7 +305,18 @@ void main() {
       for (var i = 0; i < 10; i++) {
         await tester.pump(const Duration(milliseconds: 50));
       }
+      // The drawer's ListView builds lazily: scroll until the option exists.
       final option = find.byKey(const Key('gamepadRate_30'));
+      await tester.dragUntilVisible(
+        option,
+        find
+            .descendant(
+              of: find.byType(Drawer),
+              matching: find.byType(Scrollable),
+            )
+            .first,
+        const Offset(0, -200),
+      );
       await tester.ensureVisible(option);
       await tester.pump(const Duration(milliseconds: 50));
       await tester.tap(option);
