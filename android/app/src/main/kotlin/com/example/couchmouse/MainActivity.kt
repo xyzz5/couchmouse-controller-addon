@@ -7,18 +7,26 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.hardware.input.InputManager
 import android.os.Bundle
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
+import android.os.Process
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
     private companion object {
+        const val GAMEPAD_UI_INTERVAL_MS = 33L // ~30 Hz is plenty for a status display
         // Max silence on the HID link before a keep-alive report (see updateLinkKeepAlive).
         const val LINK_KEEPALIVE_MS = 50L
 
@@ -32,14 +40,56 @@ class MainActivity : FlutterActivity() {
     private val settingsDocuments = SettingsDocuments(this)
 
     private var bluetoothAdapter: BluetoothAdapter? = null
-    private var bluetoothHidDevice: BluetoothHidDevice? = null
-    private var hostDevice: BluetoothDevice? = null
+    // Volatile: also read by the gamepad sender thread (see sendReport).
+    @Volatile private var bluetoothHidDevice: BluetoothHidDevice? = null
+    @Volatile private var hostDevice: BluetoothDevice? = null
     private var keyboardReportHost: BluetoothDevice? = null
     private var keyboardInputResumed = false
 
-    // Link keep-alive state (main thread only; see updateLinkKeepAlive).
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var lastReportSentAt = 0L // SystemClock.uptimeMillis()
+
+    // Gamepad forwarding (Report ID 3). Input events, method-channel calls and
+    // HID callbacks (mainExecutor) run on the main thread; reports are sent at a
+    // fixed rate from a dedicated sender thread via [gamepadPump].
+    private var gamepadModeEnabled = false
+    private var windowFocused = false
+    private val gamepadMapper = GamepadInputMapper()
+
+    // Report sender (see GamepadReportPump for the policy). Its own thread
+    // keeps main-thread work (UI, input dispatch) from delaying reports.
+    private val gamepadSenderThread =
+        HandlerThread("GamepadReportPump", Process.THREAD_PRIORITY_DISPLAY).apply { start() }
+    private val gamepadSender = Handler(gamepadSenderThread.looper)
+    private val gamepadPump = GamepadReportPump(send = { report -> sendReport(GamepadReport.REPORT_ID, report) })
+    private val gamepadTick = Runnable { runGamepadPump() }
+    // Axis layout per InputDevice id. Android assigns a new id when a
+    // controller reconnects, and the cache is cleared whenever the mode toggles.
+    private val gamepadLayouts = HashMap<Int, GamepadAxisLayout>()
+
+    // Live gamepad state for the Flutter UI, throttled so the UI bridge is
+    // never in the input -> HID hot path.
+    private var pendingUiGamepadState: GamepadState? = null
+    private val flushGamepadUi = Runnable {
+        val state = pendingUiGamepadState ?: return@Runnable
+        pendingUiGamepadState = null
+        notifyFlutter("onGamepadState", gamepadStateToMap(state))
+    }
+
+    private val inputDeviceListener = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) = onControllersChanged()
+        override fun onInputDeviceRemoved(deviceId: Int) {
+            gamepadLayouts.remove(deviceId)
+            onControllersChanged()
+        }
+        override fun onInputDeviceChanged(deviceId: Int) {
+            gamepadLayouts.remove(deviceId)
+            onControllersChanged()
+        }
+    }
+
+    // Link keep-alive state (see updateLinkKeepAlive). The keep-alive itself runs on
+    // the main thread; lastReportSentAt is also written by the gamepad sender thread.
+    @Volatile private var lastReportSentAt = 0L // SystemClock.uptimeMillis()
     private val neutralKeyboardReport = ByteArray(8)
     private var heldKeyboardReport: ByteArray? = null
     private val linkKeepAliveTick = Runnable { runLinkKeepAlive() }
@@ -73,6 +123,8 @@ class MainActivity : FlutterActivity() {
         } else {
             registerReceiver(bluetoothReceiver, filter)
         }
+        (getSystemService(Context.INPUT_SERVICE) as? InputManager)
+            ?.registerInputDeviceListener(inputDeviceListener, mainHandler)
     }
 
     private fun initBluetoothHID() {
@@ -106,7 +158,7 @@ class MainActivity : FlutterActivity() {
                         hostDevice = null
                         isRegistered = false
                         resetHidSession()
-                        updateLinkKeepAlive()
+                        updateGamepadStreaming()
                         notifyFlutter("onRegistrationChanged", mapOf("registered" to false))
                         notifyFlutter("onConnectionStateChanged", mapOf("connected" to false))
                     }
@@ -127,7 +179,9 @@ class MainActivity : FlutterActivity() {
             "CouchMouse",
             "CouchMouse Controller",
             "CouchMouseDev",
-            0xC0.toByte(), // Subclass descriptor code representing Combo Keyboard/Mouse
+            // HIDDeviceSubclass: 0xC0 (combo keyboard/pointing) | 0x08 (gamepad).
+            // Most hosts rely on the report descriptor rather than this value.
+            0xC8.toByte(),
             HidDescriptors.COMPOSITE_DESCRIPTOR
         )
 
@@ -145,7 +199,7 @@ class MainActivity : FlutterActivity() {
                         Log.d(TAG, "Application HID Profile registration state: $registered")
                         isRegistered = registered
                         if (!registered) resetHidSession()
-                        updateLinkKeepAlive()
+                        updateGamepadStreaming()
                         notifyFlutter("onRegistrationChanged", mapOf("registered" to registered))
                     }
 
@@ -165,11 +219,13 @@ class MainActivity : FlutterActivity() {
                                 Log.i(TAG, "Connected to host: $deviceName")
                                 if (hostDevice != device) resetHidSession()
                                 hostDevice = device
+                                updateGamepadStreaming()
                             }
                             BluetoothProfile.STATE_DISCONNECTED -> {
                                 Log.i(TAG, "Disconnected from host")
                                 hostDevice = null
                                 resetHidSession()
+                                updateGamepadStreaming()
                             }
                         }
                         updateLinkKeepAlive()
@@ -190,6 +246,7 @@ class MainActivity : FlutterActivity() {
                             val data = when (id.toInt()) {
                                 1 -> ByteArray(8) // Keyboard
                                 2 -> ByteArray(4) // Mouse
+                                GamepadReport.REPORT_ID -> gamepadPump.currentReport() // Gamepad
                                 else -> ByteArray(bufferSize.coerceAtLeast(1))
                             }
                             try {
@@ -424,7 +481,10 @@ class MainActivity : FlutterActivity() {
                             hostDevice
                         }
                         if (device != null) {
-                            if (device == hostDevice) releaseKeyboard()
+                            if (device == hostDevice) {
+                                releaseKeyboard()
+                                sendNeutralGamepadNow()
+                            }
                             val success = hid.disconnect(device)
                             result.success(success)
                         } else {
@@ -483,6 +543,45 @@ class MainActivity : FlutterActivity() {
                     } else {
                         result.error("UNAVAILABLE", "No Bluetooth device currently connected.", null)
                     }
+                }
+                "setGamepadMode" -> {
+                    val enabled = call.argument<Boolean>("enabled")
+                    if (enabled == null) {
+                        result.error("INVALID_ARGUMENT", "enabled must be a boolean", null)
+                        return@setMethodCallHandler
+                    }
+                    gamepadModeEnabled = enabled
+                    gamepadLayouts.clear()
+                    // Deliver stick events as they arrive instead of once per display
+                    // frame (saves up to a frame of latency). API 30+.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        window.decorView.requestUnbufferedDispatch(
+                            if (enabled) InputDevice.SOURCE_CLASS_JOYSTICK else InputDevice.SOURCE_CLASS_NONE
+                        )
+                    }
+                    updateGamepadStreaming()
+                    // The handheld sits idle as a controller: don't let the screen sleep.
+                    if (enabled) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    } else {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                    result.success(gamepadModeEnabled)
+                }
+                "getGamepadMode" -> {
+                    result.success(gamepadModeEnabled)
+                }
+                "setGamepadReportRate" -> {
+                    val hz = call.argument<Int>("hz")
+                    if (hz == null || hz <= 0) {
+                        result.error("INVALID_ARGUMENT", "hz must be a positive integer", null)
+                        return@setMethodCallHandler
+                    }
+                    gamepadSender.post { gamepadPump.setMaxRateHz(hz) }
+                    result.success(true)
+                }
+                "getGamepadControllers" -> {
+                    result.success(physicalControllerNames())
                 }
                 else -> {
                     result.notImplemented()
@@ -561,8 +660,11 @@ class MainActivity : FlutterActivity() {
     // Runs on the main thread, like every other keyboard send, so it can never
     // re-send a stale key state after a newer one.
 
+    // In gamepad mode the report pump already sends at least every 50 ms, so the
+    // link keep-alive stands down.
     private fun linkKeepAliveWanted(): Boolean =
-        isRegistered && hostDevice != null && keyboardInputResumed && hasWindowFocus()
+        isRegistered && hostDevice != null && keyboardInputResumed && hasWindowFocus() &&
+            !gamepadModeEnabled
 
     private fun updateLinkKeepAlive() {
         mainHandler.removeCallbacks(linkKeepAliveTick)
@@ -581,6 +683,126 @@ class MainActivity : FlutterActivity() {
         mainHandler.postAtTime(linkKeepAliveTick, nextSendAt)
     }
 
+    /**
+     * Starts the fixed-rate gamepad stream when it should run (gamepad mode on,
+     * host connected, app resumed and focused) and stops it otherwise.
+     * Stopping releases everything: locally (key-up events for held buttons
+     * will go elsewhere now) and on the host (the pump flushes neutral reports).
+     */
+    private fun updateGamepadStreaming() {
+        val stream = gamepadModeEnabled && isRegistered && hostDevice != null &&
+            keyboardInputResumed && windowFocused
+        if (!stream) {
+            gamepadMapper.reset()
+            gamepadPump.update(GamepadState.NEUTRAL)
+            if (gamepadModeEnabled) publishGamepadStateToUi(GamepadState.NEUTRAL)
+        }
+        gamepadSender.post {
+            if (gamepadPump.setStreaming(stream)) runGamepadPump()
+        }
+        // Called on every registration/connection/lifecycle/focus change, so it also
+        // (re)evaluates the link keep-alive.
+        updateLinkKeepAlive()
+    }
+
+    /** Sender thread only: sends whatever is due and schedules the next wake-up. */
+    private fun runGamepadPump() {
+        gamepadSender.removeCallbacks(gamepadTick)
+        val next = gamepadPump.tick(SystemClock.uptimeMillis()) ?: return
+        gamepadSender.postAtTime(gamepadTick, next)
+    }
+
+    /** One synchronous neutral report, for when the host link is about to go away. */
+    private fun sendNeutralGamepadNow() {
+        if (gamepadModeEnabled) sendReport(GamepadReport.REPORT_ID, GamepadState.NEUTRAL.toReport())
+    }
+
+    // ---- Physical controller capture (gamepad mode) ----
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (gamepadModeEnabled && gamepadMapper.handles(event.keyCode) && isPhysicalController(event.device)) {
+            val layout = layoutFor(event.device)
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0) {
+                    gamepadMapper.onKey(event.keyCode, true, layout)
+                    onGamepadInput()
+                }
+                KeyEvent.ACTION_UP -> {
+                    gamepadMapper.onKey(event.keyCode, false, layout)
+                    onGamepadInput()
+                }
+            }
+            // Consume so Flutter UI navigation and the B -> Back fallback don't fire.
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (gamepadModeEnabled &&
+            event.isFromSource(InputDevice.SOURCE_JOYSTICK) &&
+            event.actionMasked == MotionEvent.ACTION_MOVE &&
+            isPhysicalController(event.device)
+        ) {
+            // Batched samples are skipped on purpose: only the latest position matters.
+            gamepadMapper.onMotion(layoutFor(event.device)) { axis -> event.getAxisValue(axis) }
+            onGamepadInput()
+            return true
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    private fun onGamepadInput() {
+        val state = gamepadMapper.state
+        // A change wakes the sender at once instead of waiting for the next keepalive.
+        if (gamepadPump.update(state)) gamepadSender.post(gamepadTick)
+        publishGamepadStateToUi(state)
+    }
+
+    private fun publishGamepadStateToUi(state: GamepadState) {
+        if (pendingUiGamepadState == null) mainHandler.postDelayed(flushGamepadUi, GAMEPAD_UI_INTERVAL_MS)
+        pendingUiGamepadState = state
+    }
+
+    private fun gamepadStateToMap(state: GamepadState): Map<String, Any> = mapOf(
+        "buttons" to state.buttons,
+        "hat" to state.hat,
+        "leftX" to state.leftX.toDouble(),
+        "leftY" to state.leftY.toDouble(),
+        "rightX" to state.rightX.toDouble(),
+        "rightY" to state.rightY.toDouble(),
+        "leftTrigger" to state.leftTrigger.toDouble(),
+        "rightTrigger" to state.rightTrigger.toDouble(),
+    )
+
+    private fun physicalControllerNames(): List<String> =
+        InputDevice.getDeviceIds().toList()
+            .mapNotNull { InputDevice.getDevice(it) }
+            .filter { isPhysicalController(it) }
+            .map { it.name }
+            .distinct()
+
+    private fun onControllersChanged() {
+        notifyFlutter("onGamepadControllersChanged", mapOf("controllers" to physicalControllerNames()))
+    }
+
+    private fun isPhysicalController(device: InputDevice?): Boolean {
+        if (device == null || device.isVirtual) return false
+        val sources = device.sources
+        return (sources and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+            (sources and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+    }
+
+    private fun layoutFor(device: InputDevice?): GamepadAxisLayout {
+        if (device == null) return GamepadAxisLayout.DEFAULT
+        return gamepadLayouts.getOrPut(device.id) {
+            GamepadAxisLayout.from(
+                hasAxis = { axis -> device.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK) != null },
+                flat = { axis -> device.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK)?.flat ?: 0f },
+            )
+        }
+    }
+
     private fun notifyFlutter(method: String, arguments: Map<String, Any?>) {
         cachedFlutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
             MethodChannel(messenger, CHANNEL).invokeMethod(method, arguments)
@@ -590,18 +812,20 @@ class MainActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         keyboardInputResumed = true
-        updateLinkKeepAlive()
+        updateGamepadStreaming()
     }
 
     override fun onPause() {
         keyboardInputResumed = false
         releaseKeyboard()
-        updateLinkKeepAlive()
+        updateGamepadStreaming()
         super.onPause()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
+        windowFocused = hasFocus
         if (!hasFocus) releaseKeyboard()
+        updateGamepadStreaming()
         super.onWindowFocusChanged(hasFocus)
         updateLinkKeepAlive()
     }
@@ -615,6 +839,12 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         mainHandler.removeCallbacks(linkKeepAliveTick)
         releaseKeyboard()
+        gamepadSender.removeCallbacksAndMessages(null)
+        gamepadSenderThread.quitSafely()
+        if (gamepadPump.isStreaming) sendNeutralGamepadNow()
+        mainHandler.removeCallbacks(flushGamepadUi)
+        (getSystemService(Context.INPUT_SERVICE) as? InputManager)
+            ?.unregisterInputDeviceListener(inputDeviceListener)
         settingsDocuments.close()
         cachedFlutterEngine = null
         try {
