@@ -90,6 +90,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
   bool _invertTwoFingerScroll = false;
   double _scrollSensitivity = 1.0;
   double _scrollMomentum = 0.0;
+  bool _trackball = false;
+  double _trackballFriction = 0.7;
 
   double _fractionalDx = 0.0;
   double _fractionalDy = 0.0;
@@ -1477,6 +1479,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                             mouseAcceleration: _mouseAcceleration,
                             invertTwoFingerScroll: _invertTwoFingerScroll,
                             scrollSensitivity: _scrollSensitivity,
+                            trackball: _trackball,
+                            trackballFriction: _trackballFriction,
                             onReport:
                                 ({
                                   required double dx,
@@ -1620,6 +1624,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                           mouseAcceleration: _mouseAcceleration,
                           invertTwoFingerScroll: _invertTwoFingerScroll,
                           scrollSensitivity: _scrollSensitivity,
+                          trackball: _trackball,
+                          trackballFriction: _trackballFriction,
                           onReport:
                               ({
                                 required double dx,
@@ -1850,6 +1856,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       settings.scrollSensitivity,
     );
     _scrollMomentum = settings.scrollMomentum;
+    _trackball = settings.trackball;
+    _trackballFriction = settings.trackballFriction;
 
     if (!_isSupported) {
       return Scaffold(body: SafeArea(child: _buildUnsupportedView()));
