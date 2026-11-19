@@ -592,14 +592,14 @@ class MainActivity : FlutterActivity() {
 
     /**
      * L2CAP QoS for the HID interrupt channel. The 2.5 ms access latency requests
-     * a shorter poll interval. The HID Profile Appendix D examples use the same
-     * nonzero peak bandwidth and token rate for Guaranteed service.
+     * a shorter poll interval. Peak bandwidth stays unspecified: a 4,000 B/s
+     * peak (v1.0.2) is suspected of throttling bursts of mouse reports.
      */
     private fun hidQos() = BluetoothHidDeviceAppQosSettings(
         BluetoothHidDeviceAppQosSettings.SERVICE_GUARANTEED,
         HID_QOS_BYTES_PER_SECOND, // token rate
         16, // token bucket size, bytes
-        HID_QOS_BYTES_PER_SECOND, // peak bandwidth
+        0, // peak bandwidth (0 = unspecified)
         HID_QOS_LATENCY_US,
         BluetoothHidDeviceAppQosSettings.MAX, // delay variation (don't care)
     )
